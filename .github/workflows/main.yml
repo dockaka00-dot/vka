@@ -1,0 +1,156 @@
+# Tên của workflow, hiển thị trên GitHub
+name: RDP-VPS
+
+# Kích hoạt workflow thủ công qua nút 'Run workflow'
+on:
+  workflow_dispatch:
+
+jobs:
+  # Tên của job
+  secure-rdp:
+    # Chạy trên máy ảo Windows mới nhất
+    runs-on: windows-latest
+    
+    # Thời gian tối đa cho job (3600 phút = 6 giờ)
+    timeout-minutes: 3600
+
+    steps:
+      # --- Bước 1: Bật RDP ---
+      # Bước này đảm bảo dịch vụ Remote Desktop được kích hoạt.
+      - name: 1. Bật Dịch vụ Remote Desktop
+        run: |
+          # Kích hoạt RDP bằng cách đặt cờ registry
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Ghi chú bảo mật: 
+          # Chúng ta KHÔNG tắt Xác thực Cấp độ Mạng (NLA) theo mặc định vì nó an toàn hơn.
+          # Nếu bạn gặp sự cố khi kết nối, hãy bỏ ghi chú dòng dưới đây.
+          # Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+          #                  -Name "UserAuthentication" -Value 0 -Force
+          
+          # Khởi động lại dịch vụ RDP để áp dụng các thay đổi ngay lập tức
+          Restart-Service -Name TermService -Force
+          Write-Host "Dịch vụ Remote Desktop đã được kích hoạt."
+
+      # --- Bước 2: Tạo Người dùng RDP ---
+      # Bước này tạo người dùng hoặc cập nhật mật khẩu nếu đã tồn tại (idempotent).
+      - name: 2. Tạo hoặc Cập nhật Người dùng RDP (Idempotent)
+        run: |
+          $username = "VPS"
+          $password = "Dockaka@369!GO"
+
+          # =================================================================
+          # CẢNH BÁO BẢO MẬT NGHIÊM TRỌNG (PRODUCTION SECURITY)
+          # Mật khẩu đang được mã hóa cứng trong tập lệnh. Đây là một rủi ro bảo mật.
+          # Bất kỳ ai có quyền truy cập vào mã nguồn đều có thể thấy mật khẩu này.
+          #
+          # KHUYẾN NGHỊ: Sử dụng GitHub Secrets
+          # 1. Trong Repo Settings > Secrets and variables > Actions, tạo một Secret mới tên là 'RDP_PASSWORD'.
+          # 2. Thay thế dòng '$password = ...' ở trên bằng:
+          #    $password = "${{ secrets.RDP_PASSWORD }}"
+          # =================================================================
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Kiểm tra nếu người dùng đã tồn tại (Idempotent)
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+            Write-Host "Người dùng '$username' đã tồn tại. Đang tiến hành cập nhật mật khẩu."
+            Set-LocalUser -Name $username -Password $securePass
+          } else {
+            Write-Host "Người dùng '$username' không tồn tại. Đang tạo người dùng mới."
+            New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -FullName "VPS User"
+          }
+          
+          # Thêm người dùng vào các nhóm cần thiết (Idempotent)
+          # -ErrorAction SilentlyContinue sẽ bỏ qua lỗi nếu người dùng đã là thành viên
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          
+          # Lưu tên người dùng vào biến môi trường để sử dụng ở bước sau
+          echo "RDP_USER=$username" >> $env:GITHUB_ENV
+
+      # --- Bước 3: Cài đặt Tailscale ---
+      # Tải về và cài đặt Tailscale MSI một cách im lặng.
+      - name: 3. Cài đặt Tailscale
+        run: |
+          # Ghim một phiên bản cụ thể để đảm bảo sự ổn định
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Write-Host "Đang tải Tailscale từ $tsUrl..."
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          
+          Write-Host "Đang cài đặt Tailscale..."
+          # Cài đặt im lặng, không cần khởi động lại
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          
+          Write-Host "Đang dọn dẹp trình cài đặt..."
+          Remove-Item $installerPath -Force
+
+      # --- Bước 4: Kết nối Tailscale ---
+      # Sử dụng auth key từ GitHub Secrets để xác thực và kết nối mạng.
+      - name: 4. Kết nối Tailscale
+        run: |
+          # Vị trí thực thi của Tailscale
+          $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          
+          Write-Host "Đang kết nối Tailscale..."
+          # Kết nối bằng auth key (từ Secret) và đặt tên máy chủ duy nhất
+          & $tailscaleExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Chờ Tailscale nhận địa chỉ IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+            $tsIP = & $tailscaleExe ip -4
+            if (-not $tsIP) {
+              Write-Host "Chưa nhận được IP Tailscale, đang chờ 5 giây..."
+              Start-Sleep -Seconds 5
+              $retries++
+            }
+          }
+          
+          # Xử lý lỗi nếu không kết nối được
+          if (-not $tsIP) {
+            Write-Error "Không thể nhận địa chỉ IP Tailscale sau 50 giây."
+            & $tailscaleExe status
+            exit 1
+          }
+          
+          # Lưu IP vào biến môi trường để dùng ở các bước sau
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale đã kết nối với IP: $tsIP"
+
+      # --- Bước 5: Xác minh RDP (Nội bộ) ---
+      # Một bước kiểm tra nhanh để đảm bảo RDP đang lắng nghe trên cổng 3389.
+      - name: 5. Xác minh Kết nối RDP (Nội bộ)
+        run: |
+          Write-Host "Đang kiểm tra kết nối TCP đến $env:TAILSCALE_IP:3389..."
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          
+          if (-not $testResult.TcpTestSucceeded) {
+            Write-Error "Kiểm tra kết nối TCP đến cổng RDP 3389 thất bại!"
+            Write-Host "Vui lòng kiểm tra cài đặt RDP và dịch vụ."
+            exit 1
+          }
+          
+          Write-Host "Kiểm tra kết nối TCP (nội bộ) thành công!"
+
+          # --- Bước 6: Giữ Kết nối ---
+      # Hiển thị thông tin và giữ cho runner hoạt động.
+      - name: 6. Hiển thị Thông tin & Giữ Kết nối
+        run: |
+          Write-Host "`n==============================================="
+          Write-Host "  THÔNG TIN TRUY CẬP RDP (QUA TAILSCALE) "
+          Write-Host "==============================================="
+          Write-Host "  Địa chỉ IP (Tailscale): $env:TAILSCALE_IP"
+          Write-Host "  Tên người dùng         : $env:RDP_USER"
+          Write-Host "  Mật khẩu              : Dockaka@369!GO"
+          Write-Host "===============================================`n"
+          
+          # Vòng lặp vô hạn để giữ cho job tiếp tục chạy
+          while ($true) {
+            Write-Host "[$(Get-Date)] Runner đang hoạt động. Đang chờ 5 phút..."
+            Start-Sleep -Seconds 300
+          }
